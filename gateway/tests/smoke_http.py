@@ -48,7 +48,8 @@ def wait_up(base: str) -> None:
 def main() -> int:
     run_dir = tempfile.mkdtemp(prefix="gw-smoke-")
     env = dict(os.environ, GATEWAY_RUN_DIR=run_dir,
-               GATEWAY_TCP_PORT="19005", GATEWAY_WEB_PORT="18005",
+               GATEWAY_TCP_PORT="19005", GATEWAY_BACKUP_TCP_PORT="19006",
+               GATEWAY_WEB_PORT="18005",
                COLLECTOR_FAIL_PATH=os.path.join(run_dir, "fail"))
     gw = subprocess.Popen([sys.executable, "-m", "app.main"],
                           cwd=ROOT, env=env,
@@ -110,6 +111,44 @@ def main() -> int:
         st = call("GET", base + "/api/status")
         check(st["current_version"] == "v2" and not st["fail_marker_present"],
               "old version still active, fail marker cleaned up", str(st))
+
+        print("== dual-entry readiness race via API ==")
+        idle_deadline = time.monotonic() + 15
+        while time.monotonic() < idle_deadline:
+            if not call("GET", base + "/api/status")["recorder_alive"]:
+                break
+            time.sleep(0.3)
+        call("POST", base + "/api/events/reset")
+        pe = call("POST", base + "/api/entries/primary", {"delay": 2.0})
+        be = call("POST", base + "/api/entries/backup", {"delay": 0.0})
+        check(pe.get("ok") and pe.get("delay") == 2.0 and be.get("ok"),
+              "entry policies applied", f"{pe} {be}")
+        dr = call("POST", base + "/api/recorder/start",
+                  {"mode": "dual", "count": 10, "interval": 0.05,
+                   "gap_at": 0, "gap_seconds": 0, "failover_after": 0.5,
+                   "total_timeout": 6})
+        check(dr.get("ok") and dr.get("mode") == "dual",
+              "dual recorder started via API", str(dr))
+        race_deadline = time.monotonic() + 20
+        while time.monotonic() < race_deadline:
+            rs = call("GET", base + "/api/status")["recorder"]
+            if rs.get("choice") and not rs.get("running"):
+                break
+            time.sleep(0.2)
+        by_entry = {a["entry"]: a for a in rs["attempts"]}
+        check(rs.get("choice", {}).get("entry") == "backup",
+              "backup entry won the API-driven race", str(rs.get("choice")))
+        check(by_entry.get("primary", {}).get("status") == "aborted",
+              "primary attempt aborted after the choice",
+              str(by_entry.get("primary")))
+        v = call("GET", base + "/api/verify")
+        check(v["entries"].get("backup", {}).get("count") == 10
+              and not v["entries"].get("primary")
+              and not v["duplicate_acks"],
+              "all acks attributed to the backup entry, none duplicated",
+              str(v["entries"]))
+        call("POST", base + "/api/entries/primary", {"delay": 0.0, "fail": False})
+        call("POST", base + "/api/entries/backup", {"delay": 0.0, "fail": False})
 
         print("== double start rejected ==")
         # Wait for the previous recorder to finish first; then a concurrent

@@ -26,6 +26,7 @@ from typing import Any
 from .frame import recv_frame, send_frame
 
 TCP_PORT = int(os.environ.get("GATEWAY_TCP_PORT", "9000"))
+BACKUP_TCP_PORT = int(os.environ.get("GATEWAY_BACKUP_TCP_PORT", "9001"))
 WEB_PORT = int(os.environ.get("GATEWAY_WEB_PORT", "8000"))
 RUN_DIR = os.environ.get("GATEWAY_RUN_DIR", "/var/run/gateway")
 FAIL_PATH = os.environ.get("COLLECTOR_FAIL_PATH",
@@ -33,6 +34,7 @@ FAIL_PATH = os.environ.get("COLLECTOR_FAIL_PATH",
 INITIAL_VERSION = os.environ.get("COLLECTOR_INITIAL_VERSION", "v1")
 READY_TIMEOUT = float(os.environ.get("COLLECTOR_READY_TIMEOUT", "10"))
 EVENT_HISTORY = 5000
+ENTRIES = ("primary", "backup")
 
 
 @dataclass
@@ -61,10 +63,25 @@ class Supervisor:
         self.current: Generation | None = None
         self.handover_in_progress = False
         self.listen_sock: socket.socket | None = None
+        self.listen_socks: dict[str, socket.socket] = {}
+        # Per-entry readiness policy applied to new recorder connections.
+        # ``delay`` postpones the collector's readiness reply; ``fail`` makes
+        # the entry explicitly unusable (the connection is closed right after
+        # accept, which the dual-entry recorder treats as an immediate
+        # failure and answers by trying the other entry).
+        self.entries: dict[str, dict[str, Any]] = {
+            "primary": {"port": TCP_PORT, "delay": 0.0, "fail": False},
+            "backup": {"port": BACKUP_TCP_PORT, "delay": 0.0, "fail": False},
+        }
         self._stop = threading.Event()
         self.recorder_proc: subprocess.Popen | None = None
         self.recorder_thread: threading.Thread | None = None
         self.recorder_started_at: float | None = None
+        self.recorder_mode = "single"
+        self.recorder_attempts: list[dict[str, Any]] = []
+        self.recorder_choice: dict[str, Any] | None = None
+        self.recorder_no_entry_ready: dict[str, Any] | None = None
+        self.recorder_batch: dict[str, Any] | None = None
         self.connection_count_total = 0
 
     # ------------------------------------------------------------------ #
@@ -358,76 +375,186 @@ class Supervisor:
             pass
 
     # ------------------------------------------------------------------ #
-    # Recorder-facing TCP accept loop
+    # Recorder-facing TCP accept loops (one per entry)
     # ------------------------------------------------------------------ #
-    def accept_loop(self) -> None:
-        assert self.listen_sock is not None
+    def accept_loop(self, entry: str = "primary") -> None:
+        listen_sock = self.listen_socks[entry]
         while not self._stop.is_set():
             try:
-                conn, addr = self.listen_sock.accept()
+                conn, addr = listen_sock.accept()
             except OSError:
                 return
-            peer = f"{addr[0]}:{addr[1]}"
-            # During a handover the active collector is about to give its
-            # fds away and exit; hold the new connection in the kernel
-            # backlog until the successor is current, so nothing is handed
-            # to a dying process.
-            if self.handover_in_progress:
-                deadline = time.monotonic() + READY_TIMEOUT
-                while self.handover_in_progress and time.monotonic() < deadline:
-                    time.sleep(0.05)
-            with self.lock:
-                gen = self.current
-            if gen is None or gen.dead:
-                self.log("no live collector, rejecting recorder connection")
-                conn.close()
-                continue
+            threading.Thread(
+                target=self._handle_accepted,
+                args=(entry, conn, addr), daemon=True,
+                name=f"accept-{entry}").start()
+
+    def _handle_accepted(self, entry: str, conn: socket.socket,
+                         addr: tuple[str, int]) -> None:
+        peer = f"{addr[0]}:{addr[1]}"
+        with self.lock:
+            policy = dict(self.entries.get(entry, {}))
+            wait_for_handover = self.handover_in_progress
+        # During a handover the active collector is about to give its fds
+        # away and exit; hold the new connection in the kernel backlog until
+        # the successor is current, so nothing is handed to a dying process.
+        # The wait must NOT hold self.lock: the relay thread needs it to
+        # clear handover_in_progress.
+        if wait_for_handover:
+            deadline = time.monotonic() + READY_TIMEOUT
+            while time.monotonic() < deadline:
+                with self.lock:
+                    if not self.handover_in_progress:
+                        break
+                time.sleep(0.05)
+        with self.lock:
+            gen = self.current
+        self.record_event({"type": "entry_connect", "entry": entry,
+                           "peer": peer, "delay": policy.get("delay", 0.0),
+                           "simulated_fail": policy.get("fail", False)})
+        if policy.get("fail"):
+            # Explicit entry failure: refuse to serve this entry. The
+            # recorder sees EOF before any readiness reply and fails over.
+            self.record_event({"type": "entry_failed", "entry": entry,
+                               "peer": peer,
+                               "reason": "simulated entry failure"})
+            self.log(f"entry {entry} refused connection {peer} "
+                     f"(simulated failure)")
             try:
-                send_frame(gen.ctrl,
-                           {"type": "new_conn", "peer": peer, "leftover": ""},
-                           fds=[conn.fileno()])
-            except OSError as exc:
-                self.log(f"failed to hand connection to {gen.version}: {exc}")
                 conn.close()
-                continue
-            finally:
-                conn.close()
-            with self.lock:
-                self.connection_count_total += 1
-            self.record_event({"type": "conn_accepted", "peer": peer,
-                               "version": gen.version})
+            except OSError:
+                pass
+            return
+        if gen is None or gen.dead:
+            self.log("no live collector, rejecting recorder connection")
+            conn.close()
+            return
+        try:
+            send_frame(gen.ctrl,
+                       {"type": "new_conn", "peer": peer, "leftover": "",
+                        "entry": entry, "delay": policy.get("delay", 0.0)},
+                       fds=[conn.fileno()])
+        except OSError as exc:
+            self.log(f"failed to hand connection to {gen.version}: {exc}")
+            conn.close()
+            return
+        finally:
+            conn.close()
+        with self.lock:
+            self.connection_count_total += 1
+        self.record_event({"type": "conn_accepted", "peer": peer,
+                           "entry": entry, "version": gen.version})
+
+    def set_entry_policy(self, entry: str, delay: float | None = None,
+                         fail: bool | None = None) -> dict[str, Any]:
+        if entry not in self.entries:
+            return {"ok": False, "error": f"unknown entry {entry!r}"}
+        with self.lock:
+            if delay is not None:
+                self.entries[entry]["delay"] = max(0.0, float(delay))
+            if fail is not None:
+                self.entries[entry]["fail"] = bool(fail)
+            policy = dict(self.entries[entry])
+        self.log(f"entry {entry} policy: delay={policy['delay']}s "
+                 f"simulated_fail={policy['fail']}")
+        return {"ok": True, "entry": entry, **policy}
 
     # ------------------------------------------------------------------ #
     # Simulated recorder management (driven from the web page)
     # ------------------------------------------------------------------ #
-    def start_recorder(self, count: int, interval: float,
-                       gap_at: int, gap_seconds: float) -> dict[str, Any]:
+    def start_recorder(self, mode: str = "single", count: int = 60,
+                       interval: float = 0.2, gap_at: int = 0,
+                       gap_seconds: float = 4.0,
+                       failover_after: float = 2.0,
+                       total_timeout: float = 10.0) -> dict[str, Any]:
         with self.lock:
             if self.recorder_proc is not None and self.recorder_proc.poll() is None:
                 return {"ok": False, "error": "a recorder is already running; "
                                               "it connects exactly once by design"}
             cmd = [sys.executable, "-m", "app.recorder",
+                   "--mode", mode,
                    "--host", "127.0.0.1", "--port", str(TCP_PORT),
+                   "--backup-host", "127.0.0.1",
+                   "--backup-port", str(self.entries["backup"]["port"]),
                    "--count", str(count), "--interval", str(interval),
-                   "--gap-at", str(gap_at), "--gap-seconds", str(gap_seconds)]
+                   "--gap-at", str(gap_at), "--gap-seconds", str(gap_seconds),
+                   "--failover-after", str(failover_after),
+                   "--total-timeout", str(total_timeout)]
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, text=True)
             self.recorder_proc = proc
             self.recorder_started_at = time.time()
+            self.recorder_attempts = []
+            self.recorder_choice = None
+            self.recorder_no_entry_ready = None
+            self.recorder_batch = None
+            self.recorder_mode = mode
             self.recorder_thread = threading.Thread(
                 target=self._pump_recorder_output, args=(proc,), daemon=True)
             self.recorder_thread.start()
-        self.log(f"simulated recorder started pid={proc.pid}, "
-                 f"count={count}, interval={interval}s")
-        return {"ok": True, "pid": proc.pid}
+        if mode == "dual":
+            self.log(f"dual-entry recorder started pid={proc.pid}, "
+                     f"entries=primary:{TCP_PORT} backup:"
+                     f"{self.entries['backup']['port']}, "
+                     f"failover_after={failover_after}s, "
+                     f"total_timeout={total_timeout}s")
+        else:
+            self.log(f"simulated recorder started pid={proc.pid}, "
+                     f"count={count}, interval={interval}s (single entry)")
+        return {"ok": True, "pid": proc.pid, "mode": mode}
 
     def _pump_recorder_output(self, proc: subprocess.Popen) -> None:
         assert proc.stdout is not None
         for line in proc.stdout:
-            self.record_event({"type": "recorder_log",
-                               "msg": line.rstrip()})
+            msg = line.rstrip()
+            if msg.startswith("@@GW@@ "):
+                try:
+                    report = json.loads(msg[len("@@GW@@ "):])
+                except json.JSONDecodeError:
+                    self.record_event({"type": "recorder_log", "msg": msg})
+                    continue
+                self._record_recorder_report(report)
+                continue
+            self.record_event({"type": "recorder_log", "msg": msg})
         rc = proc.wait()
         self.record_event({"type": "recorder_exited", "rc": rc})
+
+    def _record_recorder_report(self, report: dict[str, Any]) -> None:
+        kind = report.get("kind")
+        with self.lock:
+            if kind == "attempt":
+                entry = report.get("entry")
+                snapshot = dict(report)
+                # Keep the latest status per entry in one place; keep every
+                # transition in the event stream for timing inspection.
+                prev = next((a for a in self.recorder_attempts
+                             if a.get("entry") == entry), None)
+                if prev is None:
+                    self.recorder_attempts.append(snapshot)
+                else:
+                    prev.update(snapshot)
+            elif kind == "choice":
+                self.recorder_choice = dict(report)
+            elif kind == "no_entry_ready":
+                self.recorder_no_entry_ready = dict(report)
+            elif kind == "batch":
+                self.recorder_batch = dict(report)
+        self.record_event({"type": "recorder_report", **report})
+
+    def recorder_state(self) -> dict[str, Any]:
+        with self.lock:
+            proc = self.recorder_proc
+            return {
+                "mode": getattr(self, "recorder_mode", "single"),
+                "running": proc is not None and proc.poll() is None,
+                "attempts": [dict(a) for a in self.recorder_attempts],
+                "choice": dict(self.recorder_choice)
+                if self.recorder_choice else None,
+                "no_entry_ready": dict(self.recorder_no_entry_ready)
+                if self.recorder_no_entry_ready else None,
+                "batch": dict(self.recorder_batch) if self.recorder_batch else None,
+                "entries": {name: dict(p) for name, p in self.entries.items()},
+            }
 
     def stop_recorder(self) -> dict[str, Any]:
         with self.lock:
@@ -462,8 +589,13 @@ class Supervisor:
                 "current_version": self.current.version if self.current else None,
                 "handover_in_progress": self.handover_in_progress,
                 "generations": gens,
+                "entries": {name: {"port": p["port"], "delay": p["delay"],
+                                   "simulated_fail": p["fail"]}
+                            for name, p in self.entries.items()},
+                "entry_ports": {"primary": TCP_PORT, "backup": BACKUP_TCP_PORT},
                 "recorder_alive": recorder_alive,
                 "recorder_started_at": self.recorder_started_at,
+                "recorder": self.recorder_state(),
                 "tcp_connections_accepted_total": self.connection_count_total,
                 "ack_counts": {p: len(m) for p, m in self.acks.items()},
                 "acked_ids_per_connection": acked_per_peer,
@@ -481,7 +613,7 @@ class Supervisor:
     def verify(self) -> dict[str, Any]:
         """Independently check ack completeness, order and uniqueness."""
         with self.lock:
-            report: dict[str, Any] = {"connections": []}
+            report: dict[str, Any] = {"connections": [], "entries": {}}
             ok = True
             for peer, ids_map in self.acks.items():
                 ids = sorted(ids_map)
@@ -491,18 +623,40 @@ class Supervisor:
                 for rid in ids:
                     v = ids_map[rid].get("version", "?")
                     per_version.setdefault(v, []).append(rid)
+                # Entry attribution: which entry's connection carried them.
+                per_entry: dict[str, list[int]] = {}
+                for rid in ids:
+                    e = ids_map[rid].get("entry", "primary")
+                    per_entry.setdefault(e, []).append(rid)
                 conn_report = {
                     "peer": peer,
                     "count": len(ids),
                     "ids": ids,
                     "contiguous_from_1": contiguous,
                     "unique": len(ids) == len(set(ids)),
+                    "entry": ids_map[ids[0]].get("entry", "primary") if ids else None,
+                    "entries": {e: {"count": len(r), "ids": r}
+                                for e, r in sorted(per_entry.items())},
                     "versions": {v: {"count": len(r), "first_id": min(r),
                                      "last_id": max(r)}
                                  for v, r in sorted(per_version.items())},
                 }
                 report["connections"].append(conn_report)
+                for e, r in per_entry.items():
+                    slot = report["entries"].setdefault(
+                        e, {"count": 0, "ids": [], "versions": {}})
+                    slot["count"] += len(r)
+                    slot["ids"].extend(r)
+                    for rid in r:
+                        v = ids_map[rid].get("version", "?")
+                        vs = slot["versions"].setdefault(
+                            v, {"count": 0, "first_id": rid, "last_id": rid})
+                        vs["count"] += 1
+                        vs["first_id"] = min(vs["first_id"], rid)
+                        vs["last_id"] = max(vs["last_id"], rid)
                 ok = ok and contiguous and conn_report["unique"]
+            for e in report["entries"].values():
+                e["ids"].sort()
             report["duplicate_acks"] = list(self.duplicates)
             report["ok"] = ok and not self.duplicates
             return report
@@ -517,6 +671,11 @@ class Supervisor:
     # ------------------------------------------------------------------ #
     def shutdown(self) -> None:
         self._stop.set()
+        for sock in list(self.listen_socks.values()):
+            try:
+                sock.close()
+            except OSError:
+                pass
         if self.listen_sock is not None:
             try:
                 self.listen_sock.close()
@@ -541,7 +700,17 @@ def create_supervisor() -> Supervisor:
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", TCP_PORT))
     srv.listen(16)
-    sup.listen_sock = srv
+    sup.listen_socks["primary"] = srv
+    sup.listen_sock = srv  # backward-compatible alias for the primary entry
+
+    # Backup entry: a second recorder-facing listener. It is a truly separate
+    # endpoint (its own port), so the recorder's failover race is a real
+    # network-level choice, not just a flag.
+    backup_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    backup_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    backup_srv.bind(("0.0.0.0", BACKUP_TCP_PORT))
+    backup_srv.listen(16)
+    sup.listen_socks["backup"] = backup_srv
 
     first = sup.spawn_collector(INITIAL_VERSION)
     if not first.ready.wait(READY_TIMEOUT):
@@ -549,9 +718,11 @@ def create_supervisor() -> Supervisor:
     if first.failed:
         raise RuntimeError(f"initial collector failed: {first.fail_reason}")
     sup.current = first
-    sup.log(f"supervisor up: tcp=:{TCP_PORT} web=:{WEB_PORT}, "
+    sup.log(f"supervisor up: tcp=:{TCP_PORT} (primary), "
+            f"tcp=:{BACKUP_TCP_PORT} (backup), web=:{WEB_PORT}, "
             f"active collector {INITIAL_VERSION}")
 
-    threading.Thread(target=sup.accept_loop, name="accept",
-                     daemon=True).start()
+    for entry in ENTRIES:
+        threading.Thread(target=sup.accept_loop, args=(entry,),
+                         name=f"accept-{entry}", daemon=True).start()
     return sup

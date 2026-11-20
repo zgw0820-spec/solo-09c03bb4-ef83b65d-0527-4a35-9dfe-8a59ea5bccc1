@@ -29,6 +29,7 @@ def call(method, url, body=None):
 def main() -> int:
     run_dir = tempfile.mkdtemp(prefix="gw-stress-")
     env = dict(os.environ, GATEWAY_RUN_DIR=run_dir, GATEWAY_TCP_PORT="19007",
+               GATEWAY_BACKUP_TCP_PORT="19008",
                GATEWAY_WEB_PORT="18007",
                COLLECTOR_FAIL_PATH=os.path.join(run_dir, "fail"))
     gw = subprocess.Popen([sys.executable, "-m", "app.main"], cwd=ROOT,

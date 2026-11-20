@@ -21,6 +21,17 @@ Upgrade flow (the recorder's TCP connection never drops):
 
 Ack rule: one ``ack`` event per reading id, each id acked exactly once --
 the successor drains its handed-over partial buffer before reading more.
+
+Entry readiness: a recorder may connect to an entry before this collector
+is ready to accept readings on it. Each new connection carries an entry
+name (``primary`` / ``backup``) and an optional artificial readiness delay.
+Once the delay elapses the collector writes one JSON line to the recorder::
+
+    {"type": "ready", "entry": "primary", "collector": "v1", ...}
+
+A dual-entry recorder waits for that line before sending its batch. A
+legacy single-entry recorder ignores inbound bytes and streams immediately,
+so the reply is backward compatible.
 """
 from __future__ import annotations
 
@@ -66,12 +77,20 @@ class Collector:
     # ------------------------------------------------------------------ #
     # Connection bookkeeping
     # ------------------------------------------------------------------ #
-    def add_conn(self, fd: int, leftover: bytes = b"", peer: str = "") -> None:
+    def add_conn(self, fd: int, leftover: bytes = b"", peer: str = "",
+                 entry: str = "primary", ready_delay: float = 0.0,
+                 ready_at: float | None = None,
+                 ready_sent: bool = False) -> None:
         sock = socket.socket(fileno=fd)
+        if ready_at is None:
+            ready_at = time.monotonic() + max(0.0, ready_delay)
         self.conns[fd] = {
             "sock": sock,
             "buf": bytearray(leftover),
             "peer": peer,
+            "entry": entry,
+            "ready_at": ready_at,
+            "ready_sent": ready_sent,
             "closed": False,
         }
 
@@ -106,10 +125,11 @@ class Collector:
         self.log(f"collector {self.version} ready, pid={os.getpid()}")
 
         while self.running:
+            self._send_due_readiness()
             watches = [self.control]
             watches.extend(e["sock"] for e in self.conns.values())
             try:
-                readable, _, _ = select.select(watches, [], [], 1.0)
+                readable, _, _ = select.select(watches, [], [], self._poll_timeout())
             except OSError:
                 break
             for sock in readable:
@@ -125,6 +145,48 @@ class Collector:
             self.control.close()
         except OSError:
             pass
+
+    # ------------------------------------------------------------------ #
+    # Entry readiness replies
+    # ------------------------------------------------------------------ #
+    def _poll_timeout(self) -> float:
+        """Wake up in time for the next pending entry-readiness deadline."""
+        now = time.monotonic()
+        imminent = [e["ready_at"] for e in self.conns.values()
+                    if not e["ready_sent"] and not e["closed"]]
+        if not imminent:
+            return 1.0
+        return max(0.0, min(1.0, min(imminent) - now))
+
+    def _send_due_readiness(self) -> None:
+        """Emit one readiness reply per connection whose delay has elapsed."""
+        now = time.monotonic()
+        for fd, entry in list(self.conns.items()):
+            if entry["ready_sent"] or entry["closed"]:
+                continue
+            if now < entry["ready_at"]:
+                continue
+            try:
+                line = {
+                    "type": "ready",
+                    "entry": entry.get("entry", "primary"),
+                    "collector": self.version,
+                    "peer": entry.get("peer", ""),
+                    "ts": round(time.time(), 3),
+                }
+                payload = (json.dumps(line, ensure_ascii=False) + "\n")
+                entry["sock"].sendall(payload.encode("utf-8"))
+            except OSError:
+                entry["closed"] = True
+                self.close_conn(fd)
+                self.emit({"type": "conn_error",
+                           "peer": entry.get("peer", "")})
+                continue
+            entry["ready_sent"] = True
+            self.emit({"type": "entry_ready", "entry": entry.get("entry", "primary"),
+                       "peer": entry.get("peer", ""), "fd": fd})
+            self.log(f"entry {entry.get('entry', 'primary')} readiness reply "
+                     f"sent on fd={fd}")
 
     # ------------------------------------------------------------------ #
     # Control channel: new connections and handover commands
@@ -147,9 +209,18 @@ class Collector:
                 return
             fd = fds[0]
             leftover = frame.get("leftover", "").encode("latin-1")
-            self.add_conn(fd, leftover=leftover, peer=frame.get("peer", ""))
-            self.log(f"accepted recorder connection fd={fd}, "
-                     f"leftover={len(leftover)} byte(s)")
+            # time.monotonic() is CLOCK_MONOTONIC on Linux, i.e. system-wide,
+            # so an absolute deadline relayed by the previous generation is
+            # directly comparable in this process.
+            ready_at = frame.get("ready_at")
+            self.add_conn(fd, leftover=leftover, peer=frame.get("peer", ""),
+                          entry=frame.get("entry", "primary"),
+                          ready_at=float(ready_at) if ready_at is not None
+                          else None,
+                          ready_delay=float(frame.get("delay", 0.0)),
+                          ready_sent=bool(frame.get("ready_sent", False)))
+            self.log(f"accepted recorder connection fd={fd} entry="
+                     f"{frame.get('entry', 'primary')}, leftover={len(leftover)} byte(s)")
         elif ftype == "takeover":
             if not fds:
                 self.log("takeover without successor fd, refused")
@@ -186,7 +257,12 @@ class Collector:
                 send_frame(
                     successor,
                     {"type": "new_conn", "peer": entry.get("peer", ""),
-                     "leftover": bytes(entry["buf"]).decode("latin-1")},
+                     "entry": entry.get("entry", "primary"),
+                     "leftover": bytes(entry["buf"]).decode("latin-1"),
+                     "ready_sent": bool(entry.get("ready_sent")),
+                     # Absolute (system-wide CLOCK_MONOTONIC) deadline so the
+                     # readiness delay is not restarted by the handover.
+                     "ready_at": entry.get("ready_at", 0.0)},
                     fds=[sock.fileno()],
                 )
                 forwarded += 1
@@ -299,6 +375,7 @@ class Collector:
             "type": "ack",
             "id": reading_id,
             "peer": entry.get("peer", ""),
+            "entry": entry.get("entry", "primary"),
             "reading": reading,
         })
 

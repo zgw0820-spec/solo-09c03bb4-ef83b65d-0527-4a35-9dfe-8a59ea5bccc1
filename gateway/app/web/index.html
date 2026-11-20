@@ -74,12 +74,35 @@
   .small { font-size:12px; color:var(--muted); }
   .seq-banner { display:flex; gap:10px; flex-wrap:wrap; font-size:12.5px; margin-top:6px;}
   .seq-banner b { color:var(--text); }
+  .entry-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .entry-card { border:1px solid var(--line); border-radius:8px; padding:10px; font-size:13px; }
+  .entry-card.win { border-color:var(--ok); }
+  .entry-card.lose { border-color:#4b2a2a; opacity:.8; }
+  .entry-card h3 { margin:0 0 8px; font-size:13px; color:var(--text); display:flex;
+    justify-content:space-between; align-items:center; gap:6px; }
+  .entry-card .metric { display:flex; justify-content:space-between; gap:8px;
+    color:var(--muted); font-size:12px; padding:1px 0; }
+  .entry-card .metric b { color:var(--text); font-weight:600; }
+  .attempts { width:100%; border-collapse:collapse; font-size:12px; margin-top:4px; }
+  .attempts td { padding:3px 6px; border-bottom:1px solid var(--line); }
+  .status-chip { font-size:11px; padding:1px 7px; border-radius:999px; }
+  .status-chip.ready { background:rgba(52,211,153,.16); color:var(--ok); }
+  .status-chip.failed, .status-chip.timeout, .status-chip.aborted {
+    background:rgba(248,113,113,.14); color:var(--err); }
+  .status-chip.connected, .status-chip.connecting {
+    background:rgba(251,191,36,.14); color:var(--warn); }
+  .status-chip.ready_late { background:rgba(138,160,180,.16); color:var(--muted); }
+  .status-chip.none { background:rgba(138,160,180,.12); color:var(--muted); }
+  .banner { border:1px solid var(--line); border-radius:8px; padding:8px 10px;
+    font-size:12.5px; margin-bottom:8px; }
+  .banner.ok { border-color:rgba(52,211,153,.4); color:var(--ok); }
+  .banner.bad { border-color:rgba(248,113,113,.4); color:var(--err); }
 </style>
 </head>
 <body>
 <header>
   <h1>冷库网关 · 采集进程换版操作台</h1>
-  <span class="sub">记录仪只连一次 · TCP 长连接不断 · fd 交接（SCM_RIGHTS）· 读数逐条确认、仅确认一次</span>
+  <span class="sub">记录仪只连一次 · TCP 长连接不断 · fd 交接（SCM_RIGHTS）· 双入口就绪竞速 · 读数逐条确认、仅确认一次</span>
 </header>
 
 <div class="grid">
@@ -87,6 +110,14 @@
     <div class="panel" style="margin-bottom:16px">
       <h2>① 模拟记录仪（单连接连发）</h2>
       <form id="recForm">
+        <label>入口模式</label>
+        <div class="row2">
+          <div><select id="rMode" style="width:100%;background:#0c141d;border:1px solid var(--line);color:var(--text);border-radius:6px;padding:7px 9px;font-size:13px">
+            <option value="dual">双入口（先主后备用，就绪答复优先）</option>
+            <option value="single">单入口（兼容旧记录仪）</option>
+          </select></div>
+          <div><label style="margin-top:0">总等待时限(秒)</label><input type="number" id="rTotalTimeout" value="10" step="0.5" min="0.1"></div>
+        </div>
         <div class="row2">
           <div><label>读数总数</label><input type="number" id="rCount" value="60" min="1" max="10000"></div>
           <div><label>发送间隔(秒)</label><input type="number" id="rInterval" value="0.2" step="0.05" min="0.01"></div>
@@ -95,12 +126,35 @@
           <div><label>在第几笔前暂停（换版窗口，0=不暂停）</label><input type="number" id="rGapAt" value="20" min="0"></div>
           <div><label>暂停时长(秒)</label><input type="number" id="rGapSec" value="5" step="0.5" min="0"></div>
         </div>
+        <label>主入口迟迟未就绪多久后也尝试备用(秒)</label>
+        <input type="number" id="rFailoverAfter" value="2" step="0.5" min="0">
         <div class="btns" style="margin-top:10px">
-          <button type="submit" id="btnStartRec">启动记录仪（仅连接一次）</button>
+          <button type="submit" id="btnStartRec">启动记录仪</button>
           <button type="button" class="secondary" id="btnStopRec">停止</button>
         </div>
       </form>
-      <div class="small">暂停期间记录仪的 TCP 连接保持打开，正好用于切换采集进程或演练启动失败回退。</div>
+      <div class="small">双入口模式：先连主入口等就绪答复；主入口明确失败立即试备用，超过上面的秒数仍未就绪也并行试备用。最先答复的一路胜出，整批读数只走它，另一路立即中止并关闭。</div>
+    </div>
+
+    <div class="panel" style="margin-bottom:16px">
+      <h2>①b 入口就绪策略（延迟 / 故障）</h2>
+      <div class="entry-grid">
+        <div class="entry-card">
+          <h3>主入口 <span class="badge off" id="pPort">—</span></h3>
+          <label>就绪延迟(秒)</label>
+          <input type="number" id="pDelay" value="0" step="0.5" min="0">
+          <label class="check"><input type="checkbox" id="pFail"> 模拟主入口明确失败</label>
+          <button class="secondary" type="button" id="btnApplyPrimary" style="width:100%">应用主入口策略</button>
+        </div>
+        <div class="entry-card">
+          <h3>备用入口 <span class="badge off" id="bPort">—</span></h3>
+          <label>就绪延迟(秒)</label>
+          <input type="number" id="bDelay" value="0" step="0.5" min="0">
+          <label class="check"><input type="checkbox" id="bFail"> 模拟备用入口明确失败</label>
+          <button class="secondary" type="button" id="btnApplyBackup" style="width:100%">应用备用入口策略</button>
+        </div>
+      </div>
+      <div class="small" style="margin-top:8px">就绪延迟按入口分别作用于新连接；用于演示“主入口迟答”和“两边都超时”。</div>
     </div>
 
     <div class="panel" style="margin-bottom:16px">
@@ -131,10 +185,15 @@
 
   <div>
     <div class="panel" style="margin-bottom:16px">
+      <h2>⑦ 各路尝试结果（按入口）</h2>
+      <div id="raceBox"><span class="small">尚未启动双入口记录仪</span></div>
+    </div>
+
+    <div class="panel" style="margin-bottom:16px">
       <h2>④ 逐笔确认（读数编号 → 处理进程版本）</h2>
       <div class="tablewrap">
         <table>
-          <thead><tr><th>读数编号</th><th>进程版本</th><th>温度(°C)</th><th>连接</th><th>确认序号</th></tr></thead>
+          <thead><tr><th>读数编号</th><th>入口</th><th>进程版本</th><th>温度(°C)</th><th>连接</th><th>确认序号</th></tr></thead>
           <tbody id="ackBody"></tbody>
         </table>
       </div>
@@ -142,7 +201,7 @@
     </div>
 
     <div class="panel" style="margin-bottom:16px">
-      <h2>⑤ 校验结果（完整 / 有序 / 无重复）</h2>
+      <h2>⑤ 校验结果（完整 / 有序 / 无重复 · 按入口核对）</h2>
       <div class="verify" id="verifyBox">—</div>
     </div>
 

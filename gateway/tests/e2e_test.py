@@ -11,6 +11,10 @@ Scenarios:
      (remaining readings still acked, same version, no gaps/dupes).
   3. Same-fd handover: ack events before/after the swap carry the same
      peer tuple (the kernel TCP connection is untouched).
+  4. Two concurrent recorders + a reused version label.
+  5. Dual-entry readiness race (primary delayed -> backup wins; late primary
+     reply never sends), explicit primary failure -> immediate backup, and
+     both entries timing out -> batch not sent.
 
 Run:  python tests/e2e_test.py
 """
@@ -142,13 +146,84 @@ class OneShotRecorder:
                    if "connected once" in line)
 
 
+class DualRecorder:
+    """Recorder in dual-entry mode; returns its structured @@GW@@ reports."""
+
+    def __init__(self, port: int, backup_port: int, count: int,
+                 interval: float = 0.03, failover_after: float = 1.0,
+                 total_timeout: float = 6.0) -> None:
+        self.port = port
+        self.backup_port = backup_port
+        self.count = count
+        self.interval = interval
+        self.failover_after = failover_after
+        self.total_timeout = total_timeout
+        self.proc: subprocess.Popen | None = None
+        self.output = ""
+
+    def start(self) -> None:
+        cmd = [sys.executable, "-m", "app.recorder", "--mode", "dual",
+               "--host", "127.0.0.1", "--port", str(self.port),
+               "--backup-host", "127.0.0.1",
+               "--backup-port", str(self.backup_port),
+               "--count", str(self.count), "--interval", str(self.interval),
+               "--failover-after", str(self.failover_after),
+               "--total-timeout", str(self.total_timeout)]
+        self.proc = subprocess.Popen(
+            cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, env=dict(os.environ),
+        )
+
+    def stop(self) -> tuple[int, str]:
+        assert self.proc is not None
+        out, _ = self.proc.communicate(timeout=40)
+        self.output = out
+        return self.proc.returncode, out
+
+    def reports(self, kind: str | None = None) -> list[dict]:
+        items = []
+        for line in self.output.splitlines():
+            if not line.startswith("@@GW@@ "):
+                continue
+            try:
+                obj = json.loads(line[len("@@GW@@ "):])
+            except json.JSONDecodeError:
+                continue
+            if kind is None or obj.get("kind") == kind:
+                items.append(obj)
+        return items
+
+    def attempts(self) -> dict[str, dict]:
+        return {a["entry"]: a for a in self.reports("attempt")}
+
+
+def set_entry(base: str, entry: str, delay: float | None = None,
+              fail: bool | None = None) -> dict:
+    body = {}
+    if delay is not None:
+        body["delay"] = delay
+    if fail is not None:
+        body["fail"] = fail
+    return http("POST", f"{base}/api/entries/{entry}", body)
+
+
+def wait_recorder_idle(base: str, timeout: float = 20.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not http("GET", base + "/api/status")["recorder_alive"]:
+            return
+        time.sleep(0.2)
+
+
 def main() -> int:
     run_dir = tempfile.mkdtemp(prefix="gw-e2e-")
     port_tcp = 19001
+    port_backup = 19002
     port_web = 18001
     env = dict(os.environ,
                GATEWAY_RUN_DIR=run_dir,
                GATEWAY_TCP_PORT=str(port_tcp),
+               GATEWAY_BACKUP_TCP_PORT=str(port_backup),
                GATEWAY_WEB_PORT=str(port_web),
                COLLECTOR_FAIL_PATH=os.path.join(run_dir, "fail"),
                COLLECTOR_INITIAL_VERSION="v1")
@@ -339,6 +414,170 @@ def main() -> int:
                      "exactly two new TCP connections for two recorders")
         check.expect(not v4["duplicate_acks"],
                      "no duplicate acks with two concurrent connections")
+
+        # ---------------- dual-entry scenarios ---------------- #
+        print("== scenario 5: dual entry, primary delayed -> primary still wins ==")
+        http("POST", base + "/api/events/reset")
+        set_entry(base, "primary", delay=1.0)
+        set_entry(base, "backup", delay=5.0)
+        d1 = DualRecorder(port_tcp, port_backup, count=12,
+                          failover_after=2.0, total_timeout=8.0)
+        d1.start()
+        rc5, _ = d1.stop()
+        a5 = d1.attempts()
+        c5 = d1.reports("choice")
+        check.expect(rc5 == 0, "dual recorder exited cleanly", str(rc5))
+        check.expect(c5 and c5[0]["entry"] == "primary",
+                     "primary's slow readiness reply won the race",
+                     str(c5))
+        check.expect(a5["primary"]["status"] == "ready"
+                     and a5["primary"]["ready_ms"] >= 900,
+                     "primary readiness was genuinely delayed",
+                     str(a5.get("primary")))
+        check.expect("backup" not in a5,
+                     "backup was never opened (primary replied before failover)",
+                     str(list(a5)))
+        v5 = wait_acks(base, 12)
+        check.expect(v5["entries"].get("primary", {}).get("count") == 12
+                     and not v5["entries"].get("backup"),
+                     "all readings acked on the primary entry only",
+                     str(v5["entries"]))
+        check.expect(v5["ok"], "dual-entry verify passed", str(v5.get("ok")))
+
+        print("== scenario 6: dual entry, backup wins; late primary reply discarded ==")
+        http("POST", base + "/api/events/reset")
+        set_entry(base, "primary", delay=2.5)
+        set_entry(base, "backup", delay=0.5)
+        d2 = DualRecorder(port_tcp, port_backup, count=12,
+                          failover_after=1.0, total_timeout=8.0)
+        d2.start()
+        rc6, _ = d2.stop()
+        a6 = d2.attempts()
+        c6 = d2.reports("choice")
+        check.expect(rc6 == 0, "backup-win recorder exited cleanly", str(rc6))
+        check.expect(c6 and c6[0]["entry"] == "backup",
+                     "first readiness reply (backup) won", str(c6))
+        check.expect(c6[0].get("other_entry_aborted") is True,
+                     "losing primary attempt was aborted", str(c6))
+        check.expect(a6.get("primary", {}).get("status") == "aborted",
+                     "primary attempt ended aborted before its reply",
+                     str(a6.get("primary")))
+        check.expect(not a6.get("primary", {}).get("ready_ms"),
+                     "primary's late reply never became a readiness win",
+                     str(a6.get("primary")))
+        v6 = wait_acks(base, 12)
+        check.expect(v6["entries"].get("backup", {}).get("count") == 12
+                     and not v6["entries"].get("primary"),
+                     "whole batch acked on the backup entry only",
+                     str(v6["entries"]))
+        check.expect(not v6["duplicate_acks"],
+                     "late primary reply produced no duplicate acks")
+        # Give the collector time to send the still-delayed primary reply;
+        # it must never be turned into readings.
+        time.sleep(3.0)
+        v6b = http("GET", base + "/api/verify")
+        check.expect(v6b["entries"].get("backup", {}).get("count") == 12
+                     and not v6b["entries"].get("primary")
+                     and not v6b["duplicate_acks"],
+                     "3s later: late primary reply still sent nothing",
+                     str(v6b["entries"]))
+
+        print("== scenario 7: dual entry, explicit primary failure -> immediate backup ==")
+        http("POST", base + "/api/events/reset")
+        set_entry(base, "primary", delay=0.0, fail=True)
+        set_entry(base, "backup", delay=0.0, fail=False)
+        d3 = DualRecorder(port_tcp, port_backup, count=8,
+                          failover_after=5.0, total_timeout=6.0)
+        d3.start()
+        rc7, _ = d3.stop()
+        a7 = d3.attempts()
+        c7 = d3.reports("choice")
+        check.expect(rc7 == 0, "failover recorder exited cleanly", str(rc7))
+        check.expect(a7.get("primary", {}).get("status") == "failed"
+                     and a7["primary"].get("phase") == "eof_before_ready",
+                     "primary failed explicitly (closed before readiness)",
+                     str(a7.get("primary")))
+        check.expect(c7 and c7[0]["entry"] == "backup"
+                     and c7[0]["decision_ms"] < 1000,
+                     "backup was tried immediately, well before failover-threshold",
+                     str(c7))
+        v7 = wait_acks(base, 8)
+        check.expect(v7["entries"].get("backup", {}).get("count") == 8,
+                     "batch acked on backup entry after explicit failure",
+                     str(v7["entries"]))
+
+        print("== scenario 8: dual entry, both time out -> batch not sent ==")
+        http("POST", base + "/api/events/reset")
+        set_entry(base, "primary", delay=6.0, fail=False)
+        set_entry(base, "backup", delay=6.0, fail=False)
+        d4 = DualRecorder(port_tcp, port_backup, count=9,
+                          failover_after=1.0, total_timeout=2.5)
+        d4.start()
+        rc8, _ = d4.stop()
+        nr = d4.reports("no_entry_ready")
+        a8 = d4.attempts()
+        batches = d4.reports("batch")
+        check.expect(rc8 == 3, "recorder reports 'no entry ready' exit code",
+                     str(rc8))
+        check.expect(bool(nr), "no_entry_ready reported", str(nr))
+        check.expect(a8.get("primary", {}).get("status") == "timeout"
+                     and a8.get("backup", {}).get("status") == "timeout",
+                     "both attempts ended in timeout",
+                     str({k: v.get("status") for k, v in a8.items()}))
+        check.expect(not batches, "no batch was sent", str(batches))
+        time.sleep(1.0)
+        st8 = http("GET", base + "/api/status")
+        check.expect(st8["ack_counts"] == {},
+                     "collector acked nothing for the timed-out batch",
+                     str(st8["ack_counts"]))
+        print("== scenario 9: collector swap while an entry is still waiting to be ready ==")
+        http("POST", base + "/api/events/reset")
+        set_entry(base, "primary", delay=2.5)
+        set_entry(base, "backup", delay=2.5)
+        d5 = DualRecorder(port_tcp, port_backup, count=6,
+                          failover_after=0.6, total_timeout=8.0)
+        d5.start()
+        # Wait until both entry connections are accepted and waiting, then
+        # hot-swap the collector before either readiness delay elapses.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            ev = http("GET", base + "/api/events?cursor=0")["events"]
+            accepted = {e.get("entry") for e in ev
+                        if e.get("type") == "conn_accepted"}
+            if {"primary", "backup"} <= accepted:
+                break
+            time.sleep(0.05)
+        up9 = http("POST", base + "/api/upgrade",
+                   {"new_version": "v9", "simulate_fail": False})
+        check.expect(up9.get("ok") is True,
+                     "upgrade during pending readiness accepted", str(up9))
+        wait_event(base, "upgrade_completed", timeout=15)
+        rc9, _ = d5.stop()
+        c9 = d5.reports("choice")
+        check.expect(rc9 == 0, "recorder still completed its batch", str(rc9))
+        check.expect(c9 and c9[0]["entry"] in ("primary", "backup"),
+                     "one entry won after readiness crossed the handover",
+                     str(c9))
+        v9 = wait_acks(base, 6)
+        win = c9[0]["entry"]
+        check.expect(v9["entries"].get(win, {}).get("count") == 6,
+                     "batch acked on the winning entry after handover",
+                     str(v9["entries"]))
+        check.expect(not v9["duplicate_acks"],
+                     "readiness reply not duplicated across handover",
+                     str(v9["duplicate_acks"]))
+        # The waiting entry that lost must not have been sent a second
+        # readiness reply that could be mistaken for permission to send.
+        ev9 = http("GET", base + "/api/events?cursor=0")["events"]
+        ready9 = [e for e in ev9 if e.get("type") == "entry_ready"]
+        per_entry9: dict[str, int] = {}
+        for e in ready9:
+            per_entry9[e["entry"]] = per_entry9.get(e["entry"], 0) + 1
+        check.expect(all(n == 1 for n in per_entry9.values()),
+                     "each pending entry replied readiness at most once",
+                     str(per_entry9))
+        set_entry(base, "primary", delay=0.0)
+        set_entry(base, "backup", delay=0.0)
 
     finally:
         proc.terminate()

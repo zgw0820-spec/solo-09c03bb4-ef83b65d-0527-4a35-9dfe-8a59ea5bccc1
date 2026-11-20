@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-# 8000: FastAPI operation page   9000: recorder TCP endpoint
-EXPOSE 8000 9000
+# 8000: FastAPI operation page   9000: primary recorder entry
+# 9001: backup recorder entry
+EXPOSE 8000 9000 9001
 CMD ["python", "-m", "app.main"]

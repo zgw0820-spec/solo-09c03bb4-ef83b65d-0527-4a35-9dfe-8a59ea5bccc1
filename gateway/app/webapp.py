@@ -13,7 +13,7 @@ from .supervisor import RUN_DIR, Supervisor
 
 WEB_DIR = Path(__file__).parent / "web"
 
-app = FastAPI(title="冷库网关 · 采集进程换版操作台", version="1.0.0")
+app = FastAPI(title="冷库网关 · 采集进程换版操作台", version="1.1.0")
 SUP: Supervisor | None = None  # injected by app.main
 
 
@@ -29,10 +29,23 @@ class UpgradeReq(BaseModel):
 
 
 class RecorderReq(BaseModel):
+    mode: str = Field("single", pattern="^(single|dual)$",
+                      description="single = legacy one-entry; dual = race both entries")
     count: int = Field(60, ge=1, le=10000)
     interval: float = Field(0.2, ge=0.01, le=10)
     gap_at: int = Field(20, ge=0)
     gap_seconds: float = Field(4.0, ge=0, le=120)
+    failover_after: float = Field(2.0, ge=0, le=120,
+                                  description="dual: seconds before also trying backup")
+    total_timeout: float = Field(10.0, ge=0.1, le=300,
+                                 description="dual: total wait for any readiness reply")
+
+
+class EntryPolicyReq(BaseModel):
+    delay: float | None = Field(None, ge=0, le=120,
+                                description="seconds to postpone this entry's readiness reply")
+    fail: bool | None = Field(None,
+                              description="simulate an explicit failure of this entry")
 
 
 class FailMarkerReq(BaseModel):
@@ -69,10 +82,27 @@ def post_upgrade(req: UpgradeReq) -> dict:
     return result
 
 
+@app.get("/api/entries")
+def get_entries() -> dict:
+    st = sup().status()
+    return {"ok": True, "entries": st["entries"],
+            "recorder": st["recorder"]}
+
+
+@app.post("/api/entries/{entry}")
+def post_entry_policy(entry: str, req: EntryPolicyReq) -> dict:
+    result = sup().set_entry_policy(entry, delay=req.delay, fail=req.fail)
+    if not result.get("ok"):
+        raise HTTPException(404, result.get("error", "unknown entry"))
+    return result
+
+
 @app.post("/api/recorder/start")
 def post_recorder_start(req: RecorderReq) -> dict:
-    result = sup().start_recorder(req.count, req.interval,
-                                  req.gap_at, req.gap_seconds)
+    result = sup().start_recorder(
+        mode=req.mode, count=req.count, interval=req.interval,
+        gap_at=req.gap_at, gap_seconds=req.gap_seconds,
+        failover_after=req.failover_after, total_timeout=req.total_timeout)
     if not result.get("ok"):
         return JSONResponse(result, status_code=409)
     return result
