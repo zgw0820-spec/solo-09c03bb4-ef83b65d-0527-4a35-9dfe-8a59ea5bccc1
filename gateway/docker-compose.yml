@@ -1,0 +1,36 @@
+# Cold-storage gateway: collector hot-swap with TCP fd handover.
+#
+#   gateway  - supervisor + FastAPI operation page (8000) and the
+#              recorder-facing TCP service (9000). Collector generations
+#              run as child processes inside this same container so they
+#              can exchange connection fds over Unix sockets (SCM_RIGHTS).
+#   recorder - optional standalone simulated recorder, profile "recorder".
+#              The web page can also start an in-container recorder.
+services:
+  gateway:
+    build: .
+    image: coldstore-gateway:latest
+    container_name: coldstore-gateway
+    ports:
+      - "8000:8000"   # operation page: http://localhost:8000/
+      - "9000:9000"   # recorder TCP (newline JSON readings)
+    environment:
+      GATEWAY_WEB_PORT: "8000"
+      GATEWAY_TCP_PORT: "9000"
+      COLLECTOR_INITIAL_VERSION: "v1"
+      COLLECTOR_FAIL_PATH: "/var/run/gateway/collector-fail"
+    tmpfs:
+      - /var/run/gateway
+    restart: unless-stopped
+
+  # Standalone recorder on the compose network:
+  #   docker compose --profile recorder run --rm recorder \
+  #       python -m app.recorder --host gateway --port 9000 --count 60 --gap-at 20
+  recorder:
+    image: coldstore-gateway:latest
+    build: .
+    profiles: ["recorder"]
+    depends_on:
+      - gateway
+    entrypoint: ["python"]
+    command: ["-c", "import time; time.sleep(3600)"]

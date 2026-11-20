@@ -1,0 +1,364 @@
+"""End-to-end verification for the gateway, using the stdlib only.
+
+Scenarios:
+
+  1. Burst + hot swap: a recorder opens ONE tcp connection and sends a
+     long burst with a pause in the middle. We upgrade v1 -> v2 during the
+     pause. The recorder must never reconnect; all readings 1..N must be
+     acked exactly once, in order, split across the two versions.
+  2. Startup failure: request an upgrade with simulate_fail. The new
+     generation must fail to start and the old one must keep collecting
+     (remaining readings still acked, same version, no gaps/dupes).
+  3. Same-fd handover: ack events before/after the swap carry the same
+     peer tuple (the kernel TCP connection is untouched).
+
+Run:  python tests/e2e_test.py
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+
+
+def http(method: str, url: str, body: dict | None = None) -> dict:
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        # API uses 409 with a JSON body for expected conflicts such as a
+        # simulated startup failure; return the body so tests can assert.
+        return json.loads(exc.read().decode())
+
+
+def wait_status(base: str, timeout: float = 15.0) -> dict:
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        try:
+            return http("GET", base + "/api/status")
+        except (urllib.error.URLError, ConnectionResetError) as exc:
+            last = exc
+            time.sleep(0.25)
+    raise RuntimeError(f"gateway never came up: {last}")
+
+
+def wait_acks(base: str, expected: int, timeout: float = 40.0) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        v = http("GET", base + "/api/verify")
+        total = sum(c["count"] for c in v["connections"])
+        if total >= expected:
+            return v
+        time.sleep(0.3)
+    raise AssertionError(f"timed out waiting for {expected} acks, got {total}")
+
+
+def wait_event(base: str, event_type: str, timeout: float = 15.0) -> dict:
+    deadline = time.monotonic() + timeout
+    cursor = 0
+    while time.monotonic() < deadline:
+        ev = http("GET", f"{base}/api/events?cursor={cursor}")
+        cursor = ev["cursor"]
+        for e in ev["events"]:
+            if e.get("type") == event_type:
+                return e
+        time.sleep(0.25)
+    raise AssertionError(f"event {event_type} not observed within {timeout}s")
+
+
+def wait_version_dead(base: str, version: str, timeout: float = 10.0) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        st = http("GET", base + "/api/status")
+        gens = [g for g in st["generations"] if g["version"] == version]
+        if gens and not gens[0]["alive"]:
+            return gens[0]
+        time.sleep(0.25)
+    raise AssertionError(f"collector {version} still alive after {timeout}s")
+
+
+class Check:
+    def __init__(self) -> None:
+        self.passed = 0
+        self.failed: list[str] = []
+
+    def expect(self, cond: bool, name: str, detail: str = "") -> None:
+        if cond:
+            self.passed += 1
+            print(f"  PASS  {name}")
+        else:
+            self.failed.append(f"{name} {detail}")
+            print(f"  FAIL  {name} {detail}")
+
+
+class OneShotRecorder:
+    """Recorder that opens exactly one TCP connection.
+
+    Reconnect detection uses two authoritative signals: the supervisor's
+    accept counter (delta over the run) and the recorder's own stdout,
+    which prints one "connected once" line per create_connection() call.
+    """
+
+    def __init__(self, port: int, count: int, interval: float,
+                 gap_at: int = 0, gap_seconds: float = 0.0) -> None:
+        self.port = port
+        self.count = count
+        self.interval = interval
+        self.gap_at = gap_at
+        self.gap_seconds = gap_seconds
+        self.proc: subprocess.Popen | None = None
+
+    def start(self) -> None:
+        cmd = [sys.executable, "-m", "app.recorder",
+               "--host", "127.0.0.1", "--port", str(self.port),
+               "--count", str(self.count), "--interval", str(self.interval),
+               "--gap-at", str(self.gap_at),
+               "--gap-seconds", str(self.gap_seconds)]
+        self.proc = subprocess.Popen(
+            cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, env=dict(os.environ),
+        )
+
+    def stop(self) -> tuple[int, str]:
+        assert self.proc is not None
+        out, _ = self.proc.communicate(timeout=30)
+        return self.proc.returncode, out
+
+    @staticmethod
+    def connect_count(output: str) -> int:
+        return sum(1 for line in output.splitlines()
+                   if "connected once" in line)
+
+
+def main() -> int:
+    run_dir = tempfile.mkdtemp(prefix="gw-e2e-")
+    port_tcp = 19001
+    port_web = 18001
+    env = dict(os.environ,
+               GATEWAY_RUN_DIR=run_dir,
+               GATEWAY_TCP_PORT=str(port_tcp),
+               GATEWAY_WEB_PORT=str(port_web),
+               COLLECTOR_FAIL_PATH=os.path.join(run_dir, "fail"),
+               COLLECTOR_INITIAL_VERSION="v1")
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "app.main"], cwd=ROOT, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    base = f"http://127.0.0.1:{port_web}"
+    check = Check()
+    try:
+        wait_status(base)
+        print("== scenario 1: burst with hot swap v1 -> v2 ==")
+        http("POST", base + "/api/events/reset")
+        count, gap_at = 30, 12
+        accepts_before = http("GET", base + "/api/status")[
+            "tcp_connections_accepted_total"]
+        rec = OneShotRecorder(port_tcp, count=count, interval=0.12,
+                              gap_at=gap_at, gap_seconds=4.0)
+        rec.start()
+        # Let v1 ack the first few readings.
+        time.sleep(1.2)
+        st0 = http("GET", base + "/api/status")
+        check.expect(st0["current_version"] == "v1", "initial collector is v1")
+
+        up = http("POST", base + "/api/upgrade",
+                  {"new_version": "v2", "simulate_fail": False})
+        check.expect(up.get("ok") is True, "upgrade v1->v2 accepted", str(up))
+        done = wait_event(base, "upgrade_completed", timeout=15)
+        check.expect(done["connections_forwarded"] >= 1,
+                     "live tcp connection forwarded during handover",
+                     str(done))
+        wait_event(base, "handed_over", timeout=10)
+
+        st1 = http("GET", base + "/api/status")
+        check.expect(st1["current_version"] == "v2",
+                     "active collector is v2 after handover")
+        v1_dead = wait_version_dead(base, "v1")
+        check.expect(v1_dead["alive"] is False,
+                     "old collector v1 exited after handover",
+                     f"rc={v1_dead['exit_code']}")
+        check.expect(st1["tcp_connections_accepted_total"] - accepts_before == 1,
+                     "supervisor accepted exactly one new tcp connection",
+                     str(st1["tcp_connections_accepted_total"] - accepts_before))
+
+        verify = wait_acks(base, count)
+        rc, rec_out = rec.stop()
+        check.expect(rc == 0, "recorder exited cleanly")
+        check.expect(OneShotRecorder.connect_count(rec_out) == 1,
+                     "recorder opened exactly one tcp connection (no reconnect)",
+                     rec_out)
+        check.expect("connected once" in rec_out,
+                     "recorder log reports single connection")
+
+        check.expect(len(verify["connections"]) == 1,
+                     "exactly one connection produced acks")
+        conn = verify["connections"][0]
+        check.expect(conn["count"] == count,
+                     f"all {count} readings acked", f"got {conn['count']}")
+        check.expect(conn["contiguous_from_1"] and conn["unique"],
+                     "acked ids are 1..N contiguous with no duplicate")
+        check.expect(not verify["duplicate_acks"],
+                     "no reading was acked twice",
+                     str(verify["duplicate_acks"]))
+        versions = conn["versions"]
+        check.expect(set(versions) == {"v1", "v2"},
+                     "both versions processed the stream", str(versions))
+        # Ordering boundary: v1 owns a prefix, v2 the contiguous suffix.
+        v1_last = versions["v1"]["last_id"]
+        v2_first = versions["v2"]["first_id"]
+        check.expect(versions["v1"]["first_id"] == 1 and v2_first == v1_last + 1
+                     and versions["v2"]["last_id"] == count,
+                     "version boundary is a clean prefix/suffix split in send order",
+                     f"v1=1..{v1_last} v2={v2_first}..{count}")
+
+        print("== scenario 2: new version startup failure -> rollback ==")
+        http("POST", base + "/api/events/reset")
+        count2, gap_at2 = 20, 8
+        accepts_before2 = http("GET", base + "/api/status")[
+            "tcp_connections_accepted_total"]
+        rec2 = OneShotRecorder(port_tcp, count=count2, interval=0.12,
+                               gap_at=gap_at2, gap_seconds=4.0)
+        rec2.start()
+        time.sleep(1.0)
+        failed = http("POST", base + "/api/upgrade",
+                      {"new_version": "v3", "simulate_fail": True})
+        check.expect(failed.get("ok") is False and failed.get("rolled_back"),
+                     "failed upgrade reported as rolled back", str(failed))
+        wait_event(base, "upgrade_failed", timeout=10)
+        st2 = http("GET", base + "/api/status")
+        check.expect(st2["current_version"] == "v2",
+                     "active collector stays on old version after failed start")
+        verify2 = wait_acks(base, count2)
+        rc2, out2 = rec2.stop()
+        st2b = http("GET", base + "/api/status")
+        check.expect(rc2 == 0 and OneShotRecorder.connect_count(out2) == 1,
+                     "recorder kept its single connection through rollback",
+                     f"rc={rc2} connects={OneShotRecorder.connect_count(out2)}")
+        check.expect(st2b["tcp_connections_accepted_total"] - accepts_before2 == 1,
+                     "no extra tcp connection was accepted during rollback")
+        conn2 = verify2["connections"][0]
+        check.expect(conn2["count"] == count2
+                     and conn2["contiguous_from_1"] and conn2["unique"],
+                     f"all {count2} readings still acked once and in order",
+                     str(conn2["ids"]))
+        check.expect(set(conn2["versions"]) == {"v2"},
+                     "old collector v2 processed every reading after rollback",
+                     str(conn2["versions"]))
+        check.expect(not verify2["duplicate_acks"],
+                     "no duplicate acks after rollback")
+
+        print("== scenario 3: mid-line partial buffer handover ==")
+        # Tiny, rapid burst with an immediate upgrade: forces partial lines
+        # to be carried inside the handover frame without data loss.
+        http("POST", base + "/api/events/reset")
+        count3 = 40
+        accepts_before3 = http("GET", base + "/api/status")[
+            "tcp_connections_accepted_total"]
+        rec3 = OneShotRecorder(port_tcp, count=count3, interval=0.02)
+        rec3.start()
+        time.sleep(0.15)
+        up3 = http("POST", base + "/api/upgrade",
+                   {"new_version": "v4", "simulate_fail": False})
+        check.expect(up3.get("ok") is True, "rapid upgrade v2->v4 accepted")
+        wait_event(base, "upgrade_completed", timeout=15)
+        verify3 = wait_acks(base, count3)
+        rc3, out3 = rec3.stop()
+        conn3 = verify3["connections"][0]
+        check.expect(rc3 == 0 and OneShotRecorder.connect_count(out3) == 1,
+                     "rapid-burst recorder stayed on one connection")
+        check.expect(http("GET", base + "/api/status")[
+                         "tcp_connections_accepted_total"] - accepts_before3 == 1,
+                     "rapid burst used one tcp connection only")
+        check.expect(conn3["count"] == count3
+                     and conn3["contiguous_from_1"] and conn3["unique"],
+                     "no bytes lost when partial lines crossed the handover",
+                     f"count={conn3['count']}")
+        check.expect(not verify3["duplicate_acks"],
+                     "no duplicate acks across partial-line handover")
+
+        print("== scenario 4: two concurrent recorders + reused version label ==")
+        import socket as _socket
+        http("POST", base + "/api/events/reset")
+        n4 = 15
+        accepts_before4 = http("GET", base + "/api/status")[
+            "tcp_connections_accepted_total"]
+        socks = []
+        for i in range(2):
+            s = _socket.create_connection(("127.0.0.1", port_tcp), timeout=10)
+            socks.append(s)
+            for rid in range(1, 6):  # five readings before the swap
+                s.sendall(json.dumps({"id": rid, "sensor": f"r{i}",
+                                      "temp_c": -10.0 - i,
+                                      "ts": time.time()}).encode() + b"\n")
+            time.sleep(0.1)
+        # Reuse an old label (v2 already existed) to exercise pid keying.
+        up4 = http("POST", base + "/api/upgrade",
+                   {"new_version": "v2", "simulate_fail": False})
+        check.expect(up4.get("ok") is True, "reused-label upgrade accepted",
+                     str(up4))
+        wait_event(base, "upgrade_completed", timeout=15)
+        for i, s in enumerate(socks):
+            for rid in range(6, n4 + 1):
+                s.sendall(json.dumps({"id": rid, "sensor": f"r{i}",
+                                      "temp_c": -10.0 - i,
+                                      "ts": time.time()}).encode() + b"\n")
+                time.sleep(0.02)
+            s.close()
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            v4 = http("GET", base + "/api/verify")
+            if sum(c["count"] for c in v4["connections"]) >= 2 * n4:
+                break
+            time.sleep(0.3)
+        v4 = http("GET", base + "/api/verify")
+        check.expect(len(v4["connections"]) == 2,
+                     "both recorder connections tracked separately",
+                     str(len(v4["connections"])))
+        check.expect(all(c["count"] == n4 and c["contiguous_from_1"]
+                         and c["unique"] for c in v4["connections"]),
+                     "each of the two streams acked 1..15 exactly once",
+                     str(v4["connections"]))
+        check.expect(all(set(c["versions"]) == {"v4", "v2"}
+                         for c in v4["connections"]),
+                     "both connections moved v4 -> new v2 generation",
+                     str(v4["connections"]))
+        check.expect(http("GET", base + "/api/status")[
+                         "tcp_connections_accepted_total"] - accepts_before4 == 2,
+                     "exactly two new TCP connections for two recorders")
+        check.expect(not v4["duplicate_acks"],
+                     "no duplicate acks with two concurrent connections")
+
+    finally:
+        proc.terminate()
+        try:
+            gw_out, _ = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            gw_out, _ = proc.communicate()
+
+    print()
+    print(f"result: {check.passed} passed, {len(check.failed)} failed")
+    if check.failed:
+        for f in check.failed:
+            print("  -", f)
+        print("\n--- gateway output tail ---")
+        print("\n".join(gw_out.splitlines()[-40:]))
+        return 1
+    print("ALL E2E CHECKS PASSED")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

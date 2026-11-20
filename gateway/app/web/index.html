@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>冷库网关 · 采集进程换版操作台</title>
+<style>
+  :root {
+    --bg: #0f1720; --panel: #17222f; --line: #263546;
+    --text: #dce6f0; --muted: #8aa0b4; --accent: #38bdf8;
+    --ok: #34d399; --warn: #fbbf24; --err: #f87171; --v1: #60a5fa; --v2: #f472b6;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+    font:14px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif; }
+  header { padding:16px 24px; border-bottom:1px solid var(--line);
+    display:flex; align-items:baseline; gap:16px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; }
+  header .sub { color:var(--muted); font-size:12px; }
+  .grid { display:grid; grid-template-columns: 360px 1fr; gap:16px; padding:16px 24px; }
+  @media (max-width: 980px){ .grid{grid-template-columns:1fr;} }
+  .panel { background:var(--panel); border:1px solid var(--line);
+    border-radius:10px; padding:16px; }
+  .panel h2 { font-size:14px; margin:0 0 12px; color:var(--accent);
+    text-transform:uppercase; letter-spacing:.08em; }
+  .kv { display:grid; grid-template-columns: 1fr auto; gap:6px 12px;
+    font-size:13px; margin-bottom:10px; }
+  .kv .k { color:var(--muted); }
+  .badge { padding:1px 8px; border-radius:999px; font-size:12px; }
+  .badge.on { background:rgba(52,211,153,.15); color:var(--ok); }
+  .badge.off { background:rgba(138,160,180,.15); color:var(--muted); }
+  .badge.busy { background:rgba(251,191,36,.15); color:var(--warn); }
+  .badge.v1 { background:rgba(96,165,250,.18); color:var(--v1); }
+  .badge.v2 { background:rgba(244,114,182,.18); color:var(--v2); }
+  .gen { border:1px solid var(--line); border-radius:8px; padding:10px;
+    margin-bottom:8px; font-size:13px; }
+  .gen.current { border-color:var(--ok); }
+  .gen .row { display:flex; justify-content:space-between; gap:8px; }
+  .gen .meta { color:var(--muted); font-size:12px; margin-top:4px; }
+  form { margin-bottom:14px; }
+  label { display:block; font-size:12px; color:var(--muted); margin:8px 0 4px; }
+  input[type=text], input[type=number] { width:100%; background:#0c141d;
+    border:1px solid var(--line); color:var(--text); border-radius:6px;
+    padding:7px 9px; font-size:13px; }
+  .row2 { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  button { background:var(--accent); color:#062235; border:0; border-radius:6px;
+    padding:8px 12px; font-weight:600; cursor:pointer; font-size:13px; }
+  button.secondary { background:#2b3d50; color:var(--text); }
+  button.danger { background:var(--err); color:#2b0808; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .check { display:flex; align-items:center; gap:7px; margin:8px 0; color:var(--muted); font-size:12px; }
+  .btns { display:flex; gap:8px; flex-wrap:wrap; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  th,td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:600; position:sticky; top:0; background:var(--panel); }
+  .tablewrap { max-height:340px; overflow:auto; border:1px solid var(--line); border-radius:8px; }
+  .logwrap { max-height:260px; overflow:auto; font:11.5px/1.5 ui-monospace,Menlo,Consolas,monospace;
+    background:#0c141d; border:1px solid var(--line); border-radius:8px; padding:8px; }
+  .logwrap .e { padding:1px 0; color:var(--muted); white-space:pre-wrap; }
+  .logwrap .ack { color:var(--text); }
+  .logwrap .err { color:var(--err); }
+  .logwrap .ok { color:var(--ok); }
+  .logwrap .warn { color:var(--warn); }
+  .pill { font-size:11px; padding:0 6px; border-radius:4px; margin-right:6px; }
+  .pill.v1 { background:rgba(96,165,250,.2); color:var(--v1); }
+  .pill.v2 { background:rgba(244,114,182,.2); color:var(--v2); }
+  .verify { font-size:12.5px; }
+  .verify .good { color:var(--ok); } .verify .bad { color:var(--err); }
+  .toast { position:fixed; right:20px; bottom:20px; background:#223244;
+    border:1px solid var(--line); border-radius:8px; padding:10px 14px;
+    font-size:13px; opacity:0; transition:opacity .25s; max-width:380px; }
+  .toast.show { opacity:1; }
+  .toast.err { border-color:var(--err); }
+  .small { font-size:12px; color:var(--muted); }
+  .seq-banner { display:flex; gap:10px; flex-wrap:wrap; font-size:12.5px; margin-top:6px;}
+  .seq-banner b { color:var(--text); }
+</style>
+</head>
+<body>
+<header>
+  <h1>冷库网关 · 采集进程换版操作台</h1>
+  <span class="sub">记录仪只连一次 · TCP 长连接不断 · fd 交接（SCM_RIGHTS）· 读数逐条确认、仅确认一次</span>
+</header>
+
+<div class="grid">
+  <div>
+    <div class="panel" style="margin-bottom:16px">
+      <h2>① 模拟记录仪（单连接连发）</h2>
+      <form id="recForm">
+        <div class="row2">
+          <div><label>读数总数</label><input type="number" id="rCount" value="60" min="1" max="10000"></div>
+          <div><label>发送间隔(秒)</label><input type="number" id="rInterval" value="0.2" step="0.05" min="0.01"></div>
+        </div>
+        <div class="row2">
+          <div><label>在第几笔前暂停（换版窗口，0=不暂停）</label><input type="number" id="rGapAt" value="20" min="0"></div>
+          <div><label>暂停时长(秒)</label><input type="number" id="rGapSec" value="5" step="0.5" min="0"></div>
+        </div>
+        <div class="btns" style="margin-top:10px">
+          <button type="submit" id="btnStartRec">启动记录仪（仅连接一次）</button>
+          <button type="button" class="secondary" id="btnStopRec">停止</button>
+        </div>
+      </form>
+      <div class="small">暂停期间记录仪的 TCP 连接保持打开，正好用于切换采集进程或演练启动失败回退。</div>
+    </div>
+
+    <div class="panel" style="margin-bottom:16px">
+      <h2>② 采集进程换版</h2>
+      <form id="upForm">
+        <label>新版本号</label>
+        <input type="text" id="newVersion" value="v2" placeholder="例如 v2">
+        <label class="check"><input type="checkbox" id="simFail"> 模拟新版启动失败（自动回退，旧进程继续收数）</label>
+        <div class="btns">
+          <button type="submit">执行换版 / 交接</button>
+        </div>
+      </form>
+      <div class="btns">
+        <button class="secondary" id="btnMarkerOn">放置失败标记</button>
+        <button class="secondary" id="btnMarkerOff">清除失败标记</button>
+        <button class="secondary" id="btnReset">清空事件/确认记录</button>
+      </div>
+      <p class="small" style="margin-bottom:0;margin-top:8px">
+        失败标记文件存在时，下一个启动的采集进程会启动失败；用于不依赖勾选框时手动复现回退。
+      </p>
+    </div>
+
+    <div class="panel">
+      <h2>③ 进程与连接状态</h2>
+      <div id="statusBox"><span class="small">加载中…</span></div>
+    </div>
+  </div>
+
+  <div>
+    <div class="panel" style="margin-bottom:16px">
+      <h2>④ 逐笔确认（读数编号 → 处理进程版本）</h2>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>读数编号</th><th>进程版本</th><th>温度(°C)</th><th>连接</th><th>确认序号</th></tr></thead>
+          <tbody id="ackBody"></tbody>
+        </table>
+      </div>
+      <div class="seq-banner" id="seqBanner"></div>
+    </div>
+
+    <div class="panel" style="margin-bottom:16px">
+      <h2>⑤ 校验结果（完整 / 有序 / 无重复）</h2>
+      <div class="verify" id="verifyBox">—</div>
+    </div>
+
+    <div class="panel">
+      <h2>⑥ 事件流</h2>
+      <div class="logwrap" id="logBox"></div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
